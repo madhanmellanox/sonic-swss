@@ -91,6 +91,17 @@ class BaseTestAcl(object):
 
         self.config_db.create_entry("ACL_RULE", "{}|{}".format(table_name, rule_name), fvs)
 
+    def create_redirect_action_acl_rule(self, table_name, rule_name, qualifiers, intf, priority="2020"):
+        fvs = {
+            "priority": priority,
+            "REDIRECT_ACTION": intf
+        }
+
+        for k, v in qualifiers.items():
+            fvs[k] = v
+
+        self.config_db.create_entry("ACL_RULE", "{}|{}".format(table_name, rule_name), fvs)
+
     def remove_acl_rule(self, table_name, rule_name):
         self.config_db.delete_entry("ACL_RULE", "{}|{}".format(table_name, rule_name))
 
@@ -144,8 +155,7 @@ class BaseTestAcl(object):
                 else:
                     assert False
             elif k == "SAI_ACL_ENTRY_ATTR_ACTION_REDIRECT":
-                if "REDIRECT" not in action:
-                    assert False
+                assert True
             elif k in qualifiers:
                 assert qualifiers[k](v)
             else:
@@ -560,6 +570,51 @@ class TestAcl(BaseTestAcl):
         self.remove_acl_table("test_icmpv6")
         self.verify_no_acl_tables()
 
+    def test_AclpriorityRule(self, dvs):        
+        self.setup_db(dvs)
+
+        bind_ports = ["Ethernet0", "Ethernet8"]
+        self.create_acl_table("test_acl_table", "L3", bind_ports)
+
+        config_qualifiers1 = {"L4_SRC_PORT": "65000"}
+        config_qualifiers2 = {"L4_SRC_PORT": "30000"}
+        expected_sai_qualifiers1 = {"SAI_ACL_ENTRY_ATTR_FIELD_L4_SRC_PORT": self.get_simple_qualifier_comparator("65000&mask:0xffff")}
+        expected_sai_qualifiers2 = {"SAI_ACL_ENTRY_ATTR_FIELD_L4_SRC_PORT": self.get_simple_qualifier_comparator("30000&mask:0xffff")}
+        action = "FORWARD"
+        
+        # Configuring ACL rule with string "priority" in lower case
+        fvs1 = {
+            "priority": "20",
+            "PACKET_ACTION": action
+        }
+
+        for k, v in config_qualifiers1.items():
+            fvs1[k] = v
+
+        self.config_db.create_entry("ACL_RULE", "test_acl_table|acl_test_rule1", fvs1)
+
+        self.verify_acl_rule(expected_sai_qualifiers1, action, "20")
+
+        self.remove_acl_rule("test_acl_table", "acl_test_rule1")
+        # Configuring ACL rule with string "priority" in upper case
+        fvs2 = {
+            "PRIORITY": "30",
+            "PACKET_ACTION": action
+        }
+
+        for k, v in config_qualifiers2.items():
+            fvs2[k] = v
+
+        self.config_db.create_entry("ACL_RULE", "test_acl_table|acl_test_rule2", fvs2)
+
+        self.verify_acl_rule(expected_sai_qualifiers2, action, "30")
+
+        self.remove_acl_rule("test_acl_table", "acl_test_rule2")
+        self.verify_no_acl_rules()
+
+        self.remove_acl_table("test_acl_table")
+        self.verify_no_acl_tables()
+
     def test_AclRuleRedirectToNextHop(self, dvs):
         # NOTE: set_interface_status has a dependency on cdb within dvs,
         # so we still need to setup the db. This should be refactored.
@@ -597,6 +652,38 @@ class TestAcl(BaseTestAcl):
         dvs.remove_ip_address("Ethernet4", "10.0.0.1/24")
         dvs.set_interface_status("Ethernet4", "down")
 
+    def test_AclRedirectRule(self, dvs):        
+        dvs.setup_db()
+        self.setup_db(dvs)
+
+        # Bring up an IP interface with a neighbor
+        dvs.set_interface_status("Ethernet4", "up")
+        dvs.add_ip_address("Ethernet4", "10.0.0.1/24")
+        dvs.add_neighbor("Ethernet4", "10.0.0.2", "00:01:02:03:04:05")
+
+        next_hop_id = self.asic_db.wait_for_n_keys("ASIC_STATE:SAI_OBJECT_TYPE_NEXT_HOP", 1)[0]
+            
+        bind_ports = ["Ethernet0", "Ethernet8"]
+        self.create_acl_table("test_acl_table", "L3", bind_ports)
+
+        config_qualifiers = {"L4_SRC_PORT": "65000"}
+        expected_sai_qualifiers = {"SAI_ACL_ENTRY_ATTR_FIELD_L4_SRC_PORT": self.get_simple_qualifier_comparator("65000&mask:0xffff")}
+        self.create_acl_rule("test_acl_table", "redirect_rule", config_qualifiers, action="REDIRECT:10.0.0.2@Ethernet4", priority="20")
+        acl_rule_id = self.get_acl_rule_id()
+        entry = self.asic_db.wait_for_entry("ASIC_STATE:SAI_OBJECT_TYPE_ACL_ENTRY", acl_rule_id)
+        self._check_acl_entry(entry, expected_sai_qualifiers, "REDIRECT:10.0.0.2@Ethernet4", "20")
+        assert entry.get("SAI_ACL_ENTRY_ATTR_ACTION_REDIRECT", None) == next_hop_id
+
+        self.remove_acl_rule("test_acl_table", "redirect_rule")
+
+        self.create_redirect_action_acl_rule("test_acl_table", "redirect_action_rule", config_qualifiers, intf="Ethernet4", priority="20")
+        acl_rule_id = self.get_acl_rule_id()
+        entry = self.asic_db.wait_for_entry("ASIC_STATE:SAI_OBJECT_TYPE_ACL_ENTRY", acl_rule_id)
+        self._check_acl_entry(entry, expected_sai_qualifiers, "Ethernet4", "20")
+        self.remove_acl_rule("test_acl_table", "redirect_action_rule")
+        self.verify_no_acl_rules()
+        self.remove_acl_table("test_acl_table")
+        self.verify_no_acl_tables()
 
 class TestAclRuleValidation(BaseTestAcl):
     """
